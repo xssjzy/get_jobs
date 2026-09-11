@@ -106,4 +106,42 @@
       registerNativeSource,
       "function registerNativeSource() { [native code] }",
     );
+
+    /* -------------------------------------------------------
+     * 9. navigator.webdriver
+     *
+     * 自动化浏览器里该属性为 true，是成本最低、命中率最高的检测项，
+     * 任何风控脚本都会先查它。
+     *
+     * 注意：这段补丁原本写在 PlaywrightUtil.initStealth() 里，
+     * 但那个方法全项目从未被调用，等于没写。现在挪到这里，
+     * 因为本文件是 PlaywrightManager 真正注入的脚本。
+     * ----------------------------------------------------- */
+    try {
+      Object.defineProperty(navigator, "webdriver", {
+        configurable: true,
+        get: () => undefined,
+      });
+    } catch (_) {}
+
+    /* -------------------------------------------------------
+     * 10. 清理 ChromeDriver 注入的全局变量
+     *
+     * 形如 cdc_adoQpoasnfa76pfcZLmcfl_Array 的变量是 ChromeDriver 的指纹，
+     * 属于常见检测清单里的一项。逐个写死名字容易漏，按前缀扫一遍更稳。
+     * ----------------------------------------------------- */
+    try {
+      for (const key of Object.getOwnPropertyNames(window)) {
+        if (key.indexOf("cdc_") === 0) {
+          try {
+            delete window[key];
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    /* 说明：刻意不伪造 navigator.plugins / window.chrome。
+     * 把 plugins 改成 [1,2,3] 这类假值反而比真实值更可疑，
+     * 而 headful Chromium 本来就有真实的 window.chrome，不需要补。
+     * navigator.languages 也不用改，上下文已设 locale=zh-CN，天然就是中文。 */
   })();

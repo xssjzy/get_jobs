@@ -61,11 +61,49 @@ public class Boss {
     private final List<Job> resultList = new ArrayList<>();
 
     /**
+     * 连续失败多少个岗位后中止整轮投递。
+     *
+     * <p>存在的意义：Cookie 失效或触发风控之后，原先的循环毫无察觉，会拿着已经废掉的
+     * 会话把剩下几百个岗位挨个打开一遍，把一次误判放大成持续撞墙。
+     */
+    private static final int MAX_CONSECUTIVE_FAILURES = 5;
+
+    /**
+     * 触发滑块验证后，等待人工完成的最长时间（毫秒）。
+     */
+    private static final long SLIDER_VERIFY_TIMEOUT_MS = 5 * 60 * 1000L;
+
+    /**
      * 进度回调接口
      */
     @FunctionalInterface
     public interface ProgressCallback {
         void accept(String message, Integer current, Integer total);
+    }
+
+    /**
+     * 取 [minMs, maxMs] 区间内的随机毫秒数。
+     *
+     * <p>原先全流程的等待都是 PlaywrightUtil.sleep(1) 这种整秒常量，每个岗位耗时几乎
+     * 一模一样。服务端把请求时间戳做一阶差分就是一根直线，这是比任何浏览器指纹都更
+     * 容易写规则的行为特征。
+     */
+    private static long randomBetween(long minMs, long maxMs) {
+        if (maxMs <= minMs) {
+            return minMs;
+        }
+        return java.util.concurrent.ThreadLocalRandom.current().nextLong(minMs, maxMs + 1);
+    }
+
+    /**
+     * 带随机抖动的等待，用来替代固定的整秒 sleep。
+     */
+    private static void sleepRandom(long minMs, long maxMs) {
+        try {
+            Thread.sleep(randomBetween(minMs, maxMs));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     // 通过 Lombok @RequiredArgsConstructor 使用构造器注入 bossService 与 aiService
@@ -268,11 +306,22 @@ public class Boss {
             // 3. 逐个遍历所有岗位
             Locator cards = page.locator("//ul[contains(@class, 'rec-job-list')]//li[contains(@class, 'job-card-box')]");
             int count = cards.count();
+            // 连续失败计数：会话被踢或触发风控时，后续每个岗位都会失败，
+            // 到阈值就整轮中止，避免拿着废掉的会话继续撞几百次
+            int consecutiveFailures = 0;
             for (int i = 0; i < count; i++) {
                 // 检查是否需要停止
                 if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
                     progressCallback.accept("用户取消投递", i, count);
                     return;
+                }
+
+                // 列表页若被重定向到验证或登录页，先等人工处理，处理不了就整轮中止
+                if (isVerifyPage(page)) {
+                    if (!waitForSliderVerify(page)) {
+                        log.error("【{}】安全验证未通过，中止本轮投递", keyword);
+                        return;
+                    }
                 }
 
                 // 重新获取卡片，避免元素过期
@@ -390,16 +439,34 @@ public class Boss {
 
                 // 输出
                 progressCallback.accept("正在投递：" + jobName, i + 1, count);
-                resumeSubmission(keyword, job);
-                postCount++;
+                boolean ok = resumeSubmission(keyword, job);
+                if (ok) {
+                    consecutiveFailures = 0;
+                    postCount++;
+                } else {
+                    consecutiveFailures++;
+                    log.warn("【{}】岗位处理失败，连续失败 {}/{} | 岗位：{}",
+                            keyword, consecutiveFailures, MAX_CONSECUTIVE_FAILURES, jobName);
+                    if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                        log.error("【{}】连续 {} 个岗位都失败，判定会话已失效或触发风控，中止本轮投递",
+                                keyword, consecutiveFailures);
+                        progressCallback.accept(
+                                "连续 " + consecutiveFailures + " 个岗位失败，可能已掉登录或触发风控，已中止。请检查浏览器窗口",
+                                i + 1, count);
+                        return;
+                    }
+                }
 
                 // 为避免点击下面的卡片触发页面刷新：在点击5个卡片之后，每次点击后适度下滑
                 try {
                     if (i >= 5) {
                         page.evaluate("window.scrollBy(0, 140);");
-                        PlaywrightUtil.sleep(1);
+                        sleepRandom(800, 1800);
                     }
                 } catch (Throwable ignore) {}
+
+                // 岗位之间留一个随机间隔，避免每轮耗时都是同一个数
+                sleepRandom(1200, 3500);
             }
             log.info("【{}】岗位已投递完毕！已投递岗位数量:{}", keyword, postCount);
         }
@@ -607,37 +674,48 @@ public class Boss {
 
     /**
      * 备注：目前Boss无法通过新标签页打开立即沟通按钮，所以只能点击更多详情，然后从更多详情里打开聊天按钮
+     *
+     * @return true 表示本轮没有出现「疑似会话失效」的迹象（含正常投递、用户主动停止、调试模式跳过）；
+     *         false 表示关键元素找不到。会话被踢掉或触发风控时正是这个表现，
+     *         调用方据此累计连续失败次数并在超过阈值时熔断。
      */
     @SneakyThrows
-    private void resumeSubmission(String keyword, Job job) {
-        // 若收到停止指令，直接短路返回
+    private boolean resumeSubmission(String keyword, Job job) {
+        // 若收到停止指令，直接短路返回。这是用户主动行为，不计入失败
         if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
             log.info("停止指令已触发，跳过投递 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
-            return;
+            return true;
         }
-        // 调试模式：仅遍历不投递
+        // 调试模式：仅遍历不投递，同样不算失败
         if (Boolean.TRUE.equals(config.getDebugger())) {
             log.info("调试模式：仅遍历岗位，不投递 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
-            return;
+            return true;
         }
 
         // 1. 查找"查看更多信息"按钮（必须存在且新开页）
         Locator moreInfoBtn = page.locator("a.more-job-btn");
         if (moreInfoBtn.count() == 0) {
             log.warn("未找到\"查看更多信息\"按钮，跳过...");
-            return;
+            return false;
         }
         // 强制用js新开tab
         String href = moreInfoBtn.first().getAttribute("href");
         if (href == null || !href.startsWith("/job_detail/")) {
             log.warn("未获取到岗位详情链接，跳过...");
-            return;
+            return false;
         }
         String detailUrl = "https://www.zhipin.com" + href;
         // 2. 在新窗口打开详情页
         Page detailPage = page.context().newPage();
         detailPage.navigate(detailUrl);
-        PlaywrightUtil.sleep(1);
+        sleepRandom(900, 2200);
+
+        // 详情页若被重定向到验证或登录页，说明会话已经出问题，立刻上报给调用方熔断
+        if (isVerifyPage(detailPage)) {
+            waitForSliderVerify(detailPage);
+            try { detailPage.close(); } catch (Exception ignore) {}
+            return false;
+        }
 
         // 3. 查找"立即沟通"按钮
         Locator chatBtn = detailPage.locator("a.btn-startchat, a.op-btn-chat");
@@ -646,13 +724,13 @@ public class Boss {
             if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
                 log.info("停止指令已触发，结束查找聊天按钮 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
                 try { detailPage.close(); } catch (Exception ignore) {}
-                return;
+                return true;
             }
             if (chatBtn.count() > 0 && (chatBtn.first().textContent().contains("立即沟通"))) {
                 foundChatBtn = true;
                 break;
             }
-            PlaywrightUtil.sleep(1);
+            sleepRandom(700, 1600);
         }
         if (!foundChatBtn) {
             log.warn("未找到立即沟通按钮，跳过岗位: {}", job.getJobName());
@@ -661,10 +739,10 @@ public class Boss {
                 detailPage.close();
             } catch (Exception ignore) {
             }
-            return;
+            return false;
         }
         chatBtn.first().click();
-        PlaywrightUtil.sleep(1);
+        sleepRandom(900, 2200);
 
         // 4. 等待聊天输入框
         Locator inputLocator = detailPage.locator("div#chat-input.chat-input[contenteditable='true'], textarea.input-area");
@@ -673,13 +751,13 @@ public class Boss {
             if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
                 log.info("停止指令已触发，结束等待聊天输入框 | 公司：{} | 岗位：{}", job.getCompanyName(), job.getJobName());
                 try { detailPage.close(); } catch (Exception ignore) {}
-                return;
+                return true;
             }
             if (inputLocator.count() > 0 && inputLocator.first().isVisible()) {
                 inputReady = true;
                 break;
             }
-            PlaywrightUtil.sleep(1);
+            sleepRandom(700, 1600);
         }
         if (!inputReady) {
             log.warn("聊天输入框未出现，跳过: {}", job.getJobName());
@@ -688,7 +766,7 @@ public class Boss {
                 detailPage.close();
             } catch (Exception ignore) {
             }
-            return;
+            return false;
         }
 
         // 5. AI智能生成打招呼语
@@ -702,15 +780,19 @@ public class Boss {
         String message = isValidString(aiMessage) ? aiMessage : config.getSayHi();
 
         // 6. 输入打招呼语
+        //
+        // 必须走真实键盘逐字输入。此处原本对 contenteditable 直接改 innerText 再派发
+        // new Event('input')，那个事件的 isTrusted 为 false，前端一行判断就能百分百
+        // 认定是脚本，没有误报空间；而且真人打中文必然伴随输入法的 composition 事件，
+        // 合成事件一个都没有。这是整个投递流程里最容易被抓的一处。
+        //
+        // pressSequentially 走 CDP 派发真实按键，会产生完整的
+        // keydown/beforeinput/input/keyup 序列，textarea 与 contenteditable 通用，
+        // 所以也不再需要按标签名分支。
         Locator input = inputLocator.first();
         input.click();
-        Object tagObj = input.evaluate("el => el.tagName.toLowerCase()");
-        if (tagObj instanceof String && ((String) tagObj).equals("textarea")) {
-            input.fill(message);
-        } else {
-            // 对 contenteditable 节点写入文本并派发 input 事件
-            input.evaluate("(el, msg) => { el.innerText = msg; el.dispatchEvent(new Event('input')); }", message);
-        }
+        input.pressSequentially(message, new Locator.PressSequentiallyOptions()
+                .setDelay(randomBetween(60, 160)));
 
         // 7. 点击发送按钮（div.send-message 或 button.btn-send）
         Locator sendText = detailPage.locator("div.send-message, button[type='send'].btn-send, button.btn-send");
@@ -772,6 +854,10 @@ public class Boss {
                 }
             }
         }
+        // 走到这里说明整条链路的元素都找到了，会话是好的。
+        // 发送按钮没找到（sendSuccess=false）属于单个岗位的问题，不代表会话失效，
+        // 所以不触发熔断，只在上面记为投递失败。
+        return true;
     }
 
     
@@ -1113,53 +1199,64 @@ public class Boss {
         return null;
     }
 
-    private void waitForSliderVerify(Page page) {
-        String SLIDER_URL = "https://www.zhipin.com/web/user/safe/verify-slider";
-        // 最多等待5分钟（防呆，防止死循环）
-        long start = System.currentTimeMillis();
-        while (true) {
-            String url = page.url();
-            if (url != null && url.startsWith(SLIDER_URL)) {
-                progressCallback.accept("请手动完成Boss直聘滑块验证，通过后在控制台回车继续...", 0, 0);
-                System.out.println("\n【滑块验证】请手动完成Boss直聘滑块验证，通过后在控制台回车继续…");
-                try {
-                    System.in.read();
-                } catch (Exception e) {
-                    log.error("等待滑块验证输入异常: {}", e.getMessage());
-                }
-                PlaywrightUtil.sleep(1);
-                // 验证通过后页面url会变，循环再检测一次
-                continue;
-            }
-            if ((System.currentTimeMillis() - start) > 5 * 60 * 1000) {
-                throw new RuntimeException("滑块验证超时！");
-            }
-            break;
-        }
-    }
+    /** 触发风控后会被重定向到的页面前缀 */
+    private static final String SLIDER_URL_PREFIX = "https://www.zhipin.com/web/user/safe/verify-slider";
+    private static final String LOGIN_URL_PREFIX = "https://www.zhipin.com/web/user/";
 
-
-    private boolean isLoginRequired() {
+    /**
+     * 判断页面是否已被重定向到滑块验证页或登录页。
+     */
+    private boolean isVerifyPage(Page target) {
         try {
-            Locator buttonLocator = page.locator(LOGIN_BTNS);
-            if (buttonLocator.count() > 0 && buttonLocator.textContent().contains("登录")) {
-                return true;
-            }
+            String url = target.url();
+            return url != null && (url.startsWith(SLIDER_URL_PREFIX) || url.startsWith(LOGIN_URL_PREFIX));
         } catch (Exception e) {
-            try {
-                page.locator(PAGE_HEADER).waitFor();
-                Locator errorLoginLocator = page.locator(ERROR_PAGE_LOGIN);
-                if (errorLoginLocator.count() > 0) {
-                    errorLoginLocator.click();
-                }
-                return true;
-            } catch (Exception ex) {
-                log.info("没有出现403访问异常");
-            }
-            log.info("cookie有效，已登录...");
+            // 页面已关闭或不可访问，同样按异常处理
             return false;
         }
-        return false;
     }
 
+    /**
+     * 停在滑块验证页时，等待人工在浏览器窗口里完成验证。
+     *
+     * <p>原实现阻塞在 {@code System.in.read()} 上等控制台回车。本项目是网页驱动的，
+     * 用户在浏览器界面上操作，根本没有控制台可按，接上去只会让任务永久卡死。
+     * 这里改成轮询页面 URL：验证通过后 URL 会变，自然退出；超时则放弃本轮。
+     *
+     * @return true 表示验证已通过，false 表示超时或用户中途停止
+     */
+    private boolean waitForSliderVerify(Page target) {
+        long start = System.currentTimeMillis();
+        boolean notified = false;
+
+        while (isVerifyPage(target)) {
+            if (shouldStopCallback != null && Boolean.TRUE.equals(shouldStopCallback.get())) {
+                log.info("等待验证期间收到停止指令");
+                return false;
+            }
+            if (!notified) {
+                // 只提示一次，避免把进度条刷屏
+                progressCallback.accept("检测到Boss直聘安全验证，请在弹出的浏览器窗口中手动完成，完成后会自动继续", 0, 0);
+                log.warn("检测到安全验证页，等待人工处理: {}", target.url());
+                notified = true;
+            }
+            if (System.currentTimeMillis() - start > SLIDER_VERIFY_TIMEOUT_MS) {
+                log.error("安全验证等待超时（{} 分钟），本轮投递中止", SLIDER_VERIFY_TIMEOUT_MS / 60000);
+                progressCallback.accept("安全验证等待超时，已中止本轮投递", 0, 0);
+                return false;
+            }
+            sleepRandom(1500, 3000);
+        }
+
+        if (notified) {
+            log.info("安全验证已通过，继续投递");
+            progressCallback.accept("安全验证已通过，继续投递", 0, 0);
+        }
+        return true;
+    }
+
+
+    // 已删除 isLoginRequired()：它从定义之日起就没有任何调用方，而且逻辑可疑
+    // （catch 分支里会去点登录按钮，是带副作用的“检查”）。
+    // 其职责现由 isVerifyPage() 承担：只读 URL，不产生任何副作用。
 }

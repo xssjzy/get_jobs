@@ -83,9 +83,6 @@ public class PlaywrightManager {
     // 默认超时时间（毫秒）
   private static final int DEFAULT_TIMEOUT = 30000;
 
-    // Playwright调试端口
-    private static final int CDP_PORT = 7866;
-
     // 平台URL常量
     private static final String BOSS_URL = "https://www.zhipin.com";
     private static final String LIEPIN_URL = "https://www.liepin.com";
@@ -120,21 +117,29 @@ public class PlaywrightManager {
             playwright = Playwright.create();
             log.info("✓ Playwright引擎已启动");
 
-            // 创建浏览器实例，使用固定CDP端口7866，最大化启动
+            // 刻意不加 --remote-debugging-port：招聘站的风控会检查 CDP 调试端口是否开启，
+            // 而本项目没有任何代码通过 CDP 连回浏览器，开着它只是白送一个检测特征。
             browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                    .setHeadless(false) // 非无头模式，可视化调试
+                    .setHeadless(false) // 非无头模式，headless 本身就是强特征
                     .setSlowMo(50) // 放慢操作速度，便于调试
                     .setArgs(List.of(
-                            "--remote-debugging-port=" + CDP_PORT, // 使用固定CDP端口
                             "--start-maximized" // 最大化启动窗口
                     )));
-            log.info("✓ Chrome浏览器已启动 (调试端口: {})", CDP_PORT);
+            log.info("✓ Chrome浏览器已启动");
 
             // 创建共享的BrowserContext（所有平台在同一个窗口的不同标签页中）
+            //
+            // 刻意不覆盖 UserAgent：手工指定 UA 只改字符串，不会同步 navigator.platform
+            // 与 Sec-CH-UA-Platform 请求头。此前伪装成 macOS，而进程实际跑在 Windows 上，
+            // 同一个请求里 UA 说 Mac、平台头说 Windows，自相矛盾，一查一个准。
+            // 用 Chromium 自带的 UA 可以保证三者天然一致。
+            //
+            // locale 与时区显式设为中国：目标站点都是中文站，默认的 en-US 加上中文站访问
+            // 同样是不协调的组合。
             context = browser.newContext(new Browser.NewContextOptions()
                     .setViewportSize(null) // 不设置固定视口，使用浏览器窗口实际大小
-                    .setUserAgent(
-                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"));
+                    .setLocale("zh-CN")
+                    .setTimezoneId("Asia/Shanghai"));
             log.info("✓ BrowserContext已创建（所有平台共享）");
             injectBossInitScript(context);
 
@@ -1521,13 +1526,6 @@ public class PlaywrightManager {
      */
     public boolean isInitialized() {
         return playwright != null && browser != null && bossPage != null;
-    }
-
-    /**
-     * 获取CDP端口号
-     */
-    public int getCdpPort() {
-        return CDP_PORT;
     }
 
     /**
