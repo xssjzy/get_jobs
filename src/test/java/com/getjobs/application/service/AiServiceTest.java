@@ -170,9 +170,9 @@ class AiServiceTest {
         @Test
         @DisplayName("只包含各厂商都支持的最小字段集")
         void containsMinimalFields() {
-            var body = AiService.buildRequestBody("deepseek-chat", "你好", true);
+            var body = AiService.buildRequestBody("deepseek-flash", "你好", true);
 
-            assertEquals("deepseek-chat", body.getString("model"));
+            assertEquals("deepseek-flash", body.getString("model"));
             assertEquals(1, body.getJSONArray("messages").length());
             assertEquals("user", body.getJSONArray("messages").getJSONObject(0).getString("role"));
             assertEquals("你好", body.getJSONArray("messages").getJSONObject(0).getString("content"));

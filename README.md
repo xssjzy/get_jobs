@@ -114,7 +114,7 @@ Copy-Item db\getjobs.seed.db db\getjobs.db
 
   | 厂商 | BASE_URL | 常用模型 |
   | --- | --- | --- |
-  | DeepSeek | `https://api.deepseek.com` | `deepseek-chat` |
+  | DeepSeek | `https://api.deepseek.com` | `deepseek-flash` |
   | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
   | Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
   | 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
@@ -124,6 +124,16 @@ Copy-Item db\getjobs.seed.db db\getjobs.db
 
   > 配好后可用 `http://localhost:8888/api/ai/chat?content=你好` 验证是否连通。  
   > 国内厂商无须代理。本项目本来就要求关闭墙外代理，用国产模型在这点上更省事。
+
+  ⚠️ **上表的模型名会过期。** 各家换代时旧名字会被停用，调用直接报错。
+  例如 DeepSeek 的 `deepseek-chat` 和 `deepseek-reasoner` 已于 2026-07-24 停用。
+  报「model not found」之类的错时，去厂商控制台查当前模型名，或直接列出可用型号：
+
+  ```bash
+  curl -H "Authorization: Bearer $API_KEY" https://api.deepseek.com/v1/models
+  ```
+
+  上表最后一次核对：2026-09-11，其中只有 DeepSeek 经官方文档确认。
 
     - AI生成的打招呼语示例  
       <img src="src/main/resources/images/AiSayHi.png" alt="AI生成的打招呼语示例">

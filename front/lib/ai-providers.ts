@@ -3,6 +3,13 @@
  *
  * 这里只收录兼容 OpenAI Chat Completions 协议的厂商，后端 AiService 按该协议统一发请求。
  * 想用表里没有的厂商，选「自定义」手填地址和模型名即可，不需要改代码。
+ *
+ * ⚠️ 模型名会过期。各家换代时旧名字会被停用，调用直接报错，
+ * 例如 DeepSeek 的 deepseek-chat 就在 2026-07-24 下线了。
+ * 下面的 model 只是开箱即用的起始值，不是唯一正确答案。
+ * 报「model not found」之类的错时，去 docUrl 对应的控制台查当前模型名，
+ * 或直接请求该厂商的 GET {baseUrl}/models 列出可用型号，然后手填到模型输入框。
+ * 本表最后一次核对：2026-09-11（仅 DeepSeek 经官方文档确认，其余未逐一核对）。
  */
 export type AiProvider = {
   /** 下拉框里显示的名字 */
@@ -26,7 +33,9 @@ export const AI_PROVIDERS: Record<string, AiProvider> = {
   deepseek: {
     label: 'DeepSeek 深度求索',
     baseUrl: 'https://api.deepseek.com',
-    model: 'deepseek-chat',
+    // deepseek-chat / deepseek-reasoner 已于 2026-07-24 停用，调用会报错。
+    // deepseek-flash 是官方文档当前示例所用的名字。
+    model: 'deepseek-flash',
     docUrl: 'https://platform.deepseek.com/api_keys',
   },
   qwen: {

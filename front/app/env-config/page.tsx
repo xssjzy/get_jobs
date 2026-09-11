@@ -250,7 +250,7 @@ export default function EnvConfig() {
                     type="text"
                     value={envConfig.model}
                     onChange={(e) => setEnvConfig({ ...envConfig, model: e.target.value })}
-                    placeholder="deepseek-chat"
+                    placeholder="deepseek-flash"
                   />
                   <p className="text-xs text-muted-foreground">使用的AI模型名称</p>
                 </div>
