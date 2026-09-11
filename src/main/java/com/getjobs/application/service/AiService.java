@@ -18,231 +18,368 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 /**
  * AI 服务（Spring 管理）
- * 从数据库配置获取 BASE_URL、API_KEY、MODEL 并发起 AI 请求。
+ *
+ * <p>本类面向 <b>OpenAI Chat Completions 协议</b> 编写，而不是面向某一家厂商。
+ * 凡是兼容该协议的厂商，只要在页面上配置好 BASE_URL / API_KEY / MODEL 即可使用，无须改代码。
+ * 常见的兼容厂商包括 DeepSeek、通义千问、Kimi、智谱 GLM、火山方舟、硅基流动、OpenAI。
+ *
+ * <p>刻意不做厂商嗅探：历史版本靠模型名里是否含 reasoner、o1 等字样来切换端点，
+ * 导致 deepseek-reasoner 被打到 OpenAI 独有的 /v1/responses 上而必然失败。
+ * 现在一律走 chat/completions，参数兼容问题改为依据服务端的实际报错来降级。
  */
 @Service
 @Slf4j
 @RequiredArgsConstructor
 public class AiService {
+
+    /** chat/completions 在各厂商中的统一路径后缀 */
+    private static final String CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
+
+    /** 列出可用模型的路径后缀 */
+    private static final String MODELS_SUFFIX = "/models";
+
+    /** 未带版本段的纯域名需要补上的默认版本段 */
+    private static final String DEFAULT_VERSION_SEGMENT = "/v1";
+
+    private static final int TIMEOUT_SECONDS = 60;
+
+    private static final double DEFAULT_TEMPERATURE = 0.5;
+
     private final ConfigService configService;
     private final AiMapper aiMapper;
 
     /**
      * 发送 AI 请求（非流式）并返回回复内容。
+     *
      * @param content 用户消息内容
      * @return AI 回复文本
+     * @throws RuntimeException 请求失败或响应无法解析时抛出，由调用方决定降级策略
      */
     public String sendRequest(String content) {
-        // 读取并校验配置
         var cfg = configService.getAiConfigs();
-        String baseUrl = cfg.get("BASE_URL");
+        String endpoint = buildChatCompletionsEndpoint(cfg.get("BASE_URL"));
         String apiKey = cfg.get("API_KEY");
         String model = cfg.get("MODEL");
-        // 根据模型类型选择兼容的端点（部分“推理/Reasoning”模型需要使用 Responses API）
-        String endpoint = isResponsesModel(model)
-                ? buildResponsesEndpoint(baseUrl)
-                : buildChatCompletionsEndpoint(baseUrl);
 
-        int timeoutInSeconds = 60;
+        HttpResponse<String> response = post(endpoint, apiKey, buildRequestBody(model, content, true));
 
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(timeoutInSeconds))
-                .build();
-
-        // 构建 JSON 请求体
-        JSONObject requestData = new JSONObject();
-        requestData.put("model", model);
-        requestData.put("temperature", 0.5);
-        if (endpoint.endsWith("/responses")) {
-            // Responses API 采用 input 字段
-            requestData.put("input", content);
-            // 如需显式控制推理强度，可按需开启：
-            // JSONObject reasoning = new JSONObject();
-            // reasoning.put("effort", "medium");
-            // requestData.put("reasoning", reasoning);
-        } else {
-            // Chat Completions API 使用 messages
-            JSONArray messages = new JSONArray();
-            JSONObject message = new JSONObject();
-            message.put("role", "user");
-            message.put("content", content);
-            messages.put(message);
-            requestData.put("messages", messages);
+        // 部分推理模型（如 OpenAI o 系列）拒收 temperature，依据服务端报错去掉该参数重试一次。
+        if (response.statusCode() == 400 && mentionsTemperature(response.body())) {
+            log.warn("服务端拒收 temperature 参数，去掉后重试一次: endpoint={}, model={}", endpoint, model);
+            response = post(endpoint, apiKey, buildRequestBody(model, content, false));
         }
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(endpoint))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
-                // 某些服务（例如 Azure OpenAI）需要 api-key 头，额外加一层兼容
-                .header("api-key", apiKey)
-                .POST(HttpRequest.BodyPublishers.ofString(requestData.toString()))
-                .build();
-
-        try {
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                JSONObject responseObject = new JSONObject(response.body());
-
-                String requestId = responseObject.optString("id");
-                long created = responseObject.optLong("created", 0);
-                String usedModel = responseObject.optString("model");
-
-                String responseContent;
-                if (endpoint.endsWith("/responses")) {
-                    // Responses API：优先读取 output_text
-                    responseContent = responseObject.optString("output_text", null);
-                    if (responseContent == null || responseContent.isEmpty()) {
-                        // 兜底：尝试从通用 choices/message 结构读取（部分代理/兼容层会返回该结构）
-                        try {
-                            JSONObject messageObject = responseObject.getJSONArray("choices")
-                                    .getJSONObject(0)
-                                    .getJSONObject("message");
-                            responseContent = messageObject.getString("content");
-                        } catch (Exception ignore) {
-                            responseContent = response.body(); // 最后兜底：返回原始文本，避免空值
-                        }
-                    }
-                } else {
-                    // Chat Completions API
-                    JSONObject messageObject = responseObject.getJSONArray("choices")
-                            .getJSONObject(0)
-                            .getJSONObject("message");
-                    responseContent = messageObject.getString("content");
-                }
-
-                JSONObject usageObject = responseObject.optJSONObject("usage");
-                int promptTokens = usageObject != null ? usageObject.optInt("prompt_tokens", -1) : -1;
-                int completionTokens = usageObject != null ? usageObject.optInt("completion_tokens", -1) : -1;
-                int totalTokens = usageObject != null ? usageObject.optInt("total_tokens", -1) : -1;
-
-                LocalDateTime createdTime = created > 0
-                        ? Instant.ofEpochSecond(created).atZone(ZoneId.systemDefault()).toLocalDateTime()
-                        : LocalDateTime.now();
-                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
-
-                log.info("AI响应: id={}, time={}, model={}, promptTokens={}, completionTokens={}, totalTokens={}",
-                        requestId, createdTime.format(formatter), usedModel, promptTokens, completionTokens, totalTokens);
-
-                return responseContent;
-            } else {
-                // 更详细的错误日志，便于定位 400 问题
-                log.error("AI请求失败: status={}, endpoint={}, body={}", response.statusCode(), endpoint, response.body());
-                // 针对 Responses-only 模型误用 Chat Completions 的常见错误做一次自动重试
-                if (!endpoint.endsWith("/responses") && containsReasoningParamError(response.body())) {
-                    String fallbackEndpoint = buildResponsesEndpoint(baseUrl);
-                    log.warn("检测到 reasoning 相关参数错误，自动切换到 Responses API 重试: {}", fallbackEndpoint);
-                    return sendRequestViaResponses(content, apiKey, model, fallbackEndpoint);
-                }
-                throw new RuntimeException("AI请求失败，状态码: " + response.statusCode() + ", 详情: " + response.body());
-            }
-        } catch (Exception e) {
-            log.error("调用AI服务异常", e);
-            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
-        }
-    }
-
-    private String normalizeBaseUrl(String baseUrl) {
-        if (baseUrl == null) return "";
-        String trimmed = baseUrl.trim();
-        return trimmed.endsWith("/") ? trimmed.substring(0, trimmed.length() - 1) : trimmed;
-    }
-
-    /**
-     * 根据配置构造 chat/completions 端点，避免重复拼接 /v1
-     */
-    private String buildChatCompletionsEndpoint(String baseUrl) {
-        String normalized = normalizeBaseUrl(baseUrl);
-        // 如果 baseUrl 已经包含 /v1（常见配置为 https://api.openai.com/v1），则只拼接 /chat/completions
-        if (normalized.endsWith("/v1") || normalized.contains("/v1/")) {
-            return normalized + "/chat/completions";
-        }
-        return normalized + "/v1/chat/completions";
-    }
-
-    /**
-     * 构造 Responses API 端点
-     */
-    private String buildResponsesEndpoint(String baseUrl) {
-        String normalized = normalizeBaseUrl(baseUrl);
-        if (normalized.endsWith("/v1") || normalized.contains("/v1/")) {
-            return normalized + "/responses";
-        }
-        return normalized + "/v1/responses";
-    }
-
-    /**
-     * 粗略识别需要使用 Responses API 的模型（o-系列、4.1、reasoner 等）
-     */
-    private boolean isResponsesModel(String model) {
-        if (model == null) return false;
-        String m = model.toLowerCase();
-        return m.contains("o1") || m.contains("o3") || m.contains("o4")
-                || m.contains("4.1") || m.contains("reasoner")
-                || m.contains("4o-mini") || m.contains("gpt-4o-mini");
-    }
-
-    /**
-     * 检查错误响应中是否包含 reasoning 相关参数错误（如 reasoning.summary unsupported_value）
-     */
-    private boolean containsReasoningParamError(String body) {
-        if (body == null) return false;
-        String s = body.toLowerCase();
-        return (s.contains("reasoning") && s.contains("unsupported_value"))
-                || s.contains("reasoning.summary");
-    }
-
-    /**
-     * 使用 Responses API 发送一次请求（用于自动降级/重试）
-     */
-    private String sendRequestViaResponses(String content, String apiKey, String model, String endpoint) {
-        int timeoutInSeconds = 60;
-        HttpClient client = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(timeoutInSeconds))
-                .build();
-
-        JSONObject requestData = new JSONObject();
-        requestData.put("model", model);
-        requestData.put("temperature", 0.5);
-        requestData.put("input", content);
-
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(URI.create(endpoint))
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json")
-                .header("Authorization", "Bearer " + apiKey)
-                .header("api-key", apiKey)
-                .POST(HttpRequest.BodyPublishers.ofString(requestData.toString()))
-                .build();
-
-        try {
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            if (response.statusCode() == 200) {
-                JSONObject resp = new JSONObject(response.body());
-                String outputText = resp.optString("output_text", null);
-                if (outputText != null && !outputText.isEmpty()) {
-                    return outputText;
-                }
-                // 兜底解析：部分兼容层可能返回 choices/message 结构
-                try {
-                    JSONObject messageObject = resp.getJSONArray("choices")
-                            .getJSONObject(0)
-                            .getJSONObject("message");
-                    return messageObject.getString("content");
-                } catch (Exception ignore) {
-                }
-                // 无法解析则直接返回原始体，避免空值中断流程
-                return response.body();
-            }
-            log.error("Responses API 调用失败: status={}, endpoint={}, body={}", response.statusCode(), endpoint, response.body());
+        if (response.statusCode() != 200) {
+            log.error("AI请求失败: status={}, endpoint={}, model={}, body={}",
+                    response.statusCode(), endpoint, model, response.body());
             throw new RuntimeException("AI请求失败，状态码: " + response.statusCode() + ", 详情: " + response.body());
+        }
+
+        logUsage(response.body());
+
+        String replyContent = extractContent(response.body());
+        if (replyContent == null) {
+            log.error("AI响应无法解析: endpoint={}, body={}", endpoint, response.body());
+            throw new RuntimeException("AI响应无法解析，原始内容: " + response.body());
+        }
+        return replyContent;
+    }
+
+    /**
+     * 列出当前 BASE_URL 下可用的模型。
+     *
+     * <p>存在的意义：模型名会随厂商换代而停用（例如 deepseek-chat 在 2026-07-24 停用），
+     * 把名字硬编码在前端预设里迟早会腐烂。这里直接问厂商要一份当前清单。
+     *
+     * <p>由后端代为请求而不是前端直连，有两个原因：厂商接口基本都不发 CORS 头，
+     * 浏览器直连会被拦；而且密钥留在后端不必交给页面。
+     *
+     * @return 模型名列表，已去重排序
+     * @throws RuntimeException 配置缺失、请求失败或响应无法解析时抛出
+     */
+    public java.util.List<String> listAvailableModels() {
+        // 只需要地址与密钥，不要求 MODEL 已填，否则清空模型名后就拉不了清单了
+        String baseUrl = configService.requireConfigValue("BASE_URL");
+        String apiKey = configService.requireConfigValue("API_KEY");
+        String endpoint = buildModelsEndpoint(baseUrl);
+
+        HttpResponse<String> response = get(endpoint, apiKey);
+        if (response.statusCode() != 200) {
+            log.error("拉取模型列表失败: status={}, endpoint={}, body={}",
+                    response.statusCode(), endpoint, response.body());
+            throw new RuntimeException("拉取模型列表失败，状态码: " + response.statusCode()
+                    + ", 详情: " + response.body());
+        }
+
+        java.util.List<String> ids = extractModelIds(response.body());
+        if (ids.isEmpty()) {
+            log.warn("模型列表为空或无法解析: endpoint={}, body={}", endpoint, response.body());
+            throw new RuntimeException("该接口没有返回可识别的模型列表，请手动填写模型名。原始响应: "
+                    + response.body());
+        }
+        log.info("拉取到 {} 个模型: endpoint={}", ids.size(), endpoint);
+        return ids;
+    }
+
+    /**
+     * 从 OpenAI 协议的 /models 响应中取出模型名。
+     *
+     * <p>标准形状是 {@code {"object":"list","data":[{"id":"..."}]}}；
+     * 部分兼容层直接返回数组，也一并支持。取不到就返回空列表，由调用方报错。
+     */
+    static java.util.List<String> extractModelIds(String body) {
+        if (body == null || body.isBlank()) {
+            return java.util.List.of();
+        }
+        try {
+            JSONArray items;
+            String trimmed = body.trim();
+            if (trimmed.startsWith("[")) {
+                items = new JSONArray(trimmed);
+            } else {
+                items = new JSONObject(trimmed).optJSONArray("data");
+            }
+            if (items == null) {
+                return java.util.List.of();
+            }
+
+            var ids = new java.util.TreeSet<String>();
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.optJSONObject(i);
+                String id = item == null ? items.optString(i, "") : item.optString("id", "");
+                if (!id.isBlank()) {
+                    ids.add(id);
+                }
+            }
+            return java.util.List.copyOf(ids);
         } catch (Exception e) {
-            log.error("Responses API 调用异常", e);
+            return java.util.List.of();
+        }
+    }
+
+    /**
+     * 发起一次 GET 请求，认证头与 POST 保持一致。
+     */
+    private HttpResponse<String> get(String endpoint, String apiKey) {
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .timeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("api-key", apiKey)
+                .GET()
+                .build();
+
+        try {
+            return client.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            log.error("拉取模型列表异常: endpoint={}", endpoint, e);
             throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 发起一次 POST 请求。
+     *
+     * <p>同时带上 Authorization 与 api-key 两个头：前者是 OpenAI 协议的标准做法，
+     * 后者供 Azure OpenAI 这类直接填完整端点的场景使用。
+     */
+    private HttpResponse<String> post(String endpoint, String apiKey, JSONObject body) {
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .timeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("api-key", apiKey)
+                .POST(HttpRequest.BodyPublishers.ofString(body.toString()))
+                .build();
+
+        try {
+            return client.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            log.error("调用AI服务异常: endpoint={}", endpoint, e);
+            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+        }
+    }
+
+    /**
+     * 构建 OpenAI 协议的请求体，只用各厂商都支持的最小字段集。
+     *
+     * @param withTemperature 是否带上 temperature，降级重试时传 false
+     */
+    static JSONObject buildRequestBody(String model, String content, boolean withTemperature) {
+        JSONObject message = new JSONObject();
+        message.put("role", "user");
+        message.put("content", content);
+
+        JSONObject requestData = new JSONObject();
+        requestData.put("model", model);
+        requestData.put("messages", new JSONArray().put(message));
+        if (withTemperature) {
+            requestData.put("temperature", DEFAULT_TEMPERATURE);
+        }
+        return requestData;
+    }
+
+    /**
+     * 规范化 BASE_URL：去首尾空白、去掉末尾斜杠、缺协议头时补 https。
+     */
+    static String normalizeBaseUrl(String baseUrl) {
+        if (baseUrl == null) {
+            return "";
+        }
+        String trimmed = baseUrl.trim();
+        while (trimmed.endsWith("/")) {
+            trimmed = trimmed.substring(0, trimmed.length() - 1);
+        }
+        if (trimmed.isEmpty()) {
+            return "";
+        }
+        if (!trimmed.regionMatches(true, 0, "http://", 0, 7)
+                && !trimmed.regionMatches(true, 0, "https://", 0, 8)) {
+            trimmed = "https://" + trimmed;
+        }
+        return trimmed;
+    }
+
+    /**
+     * 根据 BASE_URL 推导 chat/completions 端点。
+     */
+    static String buildChatCompletionsEndpoint(String baseUrl) {
+        return buildEndpoint(baseUrl, CHAT_COMPLETIONS_SUFFIX);
+    }
+
+    /**
+     * 根据 BASE_URL 推导「列出可用模型」的端点。
+     *
+     * <p>若 BASE_URL 填的是完整的 chat/completions 地址，先退回它的父路径再拼 /models，
+     * 否则会拼出 .../chat/completions/models 这种不存在的地址。
+     */
+    static String buildModelsEndpoint(String baseUrl) {
+        String normalized = normalizeBaseUrl(baseUrl);
+        int idx = normalized.indexOf(CHAT_COMPLETIONS_SUFFIX);
+        if (idx > 0) {
+            normalized = normalized.substring(0, idx);
+        }
+        return buildEndpoint(normalized, MODELS_SUFFIX);
+    }
+
+    /**
+     * 把 BASE_URL 与目标路径后缀拼成完整端点。
+     *
+     * <p>chat/completions 与 models 共用这套规则。单独抄一份的话，拼错了不会当场报错，
+     * 只会在真正请求时变成 404，所以放在一处。
+     *
+     * <p>三条规则自上而下匹配：
+     * <ol>
+     *   <li>路径已以该后缀结尾，视为完整端点，原样使用（兼容带查询参数的 Azure 地址）</li>
+     *   <li>带路径（如智谱的 /api/paas/v4、通义千问的 /compatible-mode/v1），
+     *       说明厂商自带版本段，直接追加后缀</li>
+     *   <li>纯域名（如 api.deepseek.com），补上 /v1 再追加后缀</li>
+     * </ol>
+     */
+    static String buildEndpoint(String baseUrl, String suffix) {
+        String normalized = normalizeBaseUrl(baseUrl);
+        if (normalized.isEmpty()) {
+            throw new IllegalStateException("缺少必要配置: BASE_URL");
+        }
+
+        String path = pathOf(normalized);
+        if (path.endsWith(suffix)) {
+            return normalized;
+        }
+        if (path.isEmpty() || path.equals("/")) {
+            return normalized + DEFAULT_VERSION_SEGMENT + suffix;
+        }
+        return normalized + suffix;
+    }
+
+    /**
+     * 取出 URL 的路径部分，解析失败时返回空串（当作纯域名处理）。
+     */
+    private static String pathOf(String url) {
+        try {
+            String path = URI.create(url).getPath();
+            return path == null ? "" : path;
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * 从 OpenAI 协议响应中取出回复正文。
+     *
+     * <p>优先取 choices[0].message.content；为空时回落到 reasoning_content，
+     * 覆盖只回推理正文的兼容层。全都取不到则返回 null，由调用方报错，
+     * 避免把整段 JSON 原文当作打招呼语发出去。
+     */
+    static String extractContent(String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        try {
+            JSONObject root = new JSONObject(body);
+            JSONArray choices = root.optJSONArray("choices");
+            if (choices == null || choices.isEmpty()) {
+                return null;
+            }
+            JSONObject firstChoice = choices.optJSONObject(0);
+            JSONObject message = firstChoice == null ? null : firstChoice.optJSONObject("message");
+            if (message == null) {
+                return null;
+            }
+            String text = message.optString("content", "");
+            if (!text.isBlank()) {
+                return text;
+            }
+            String reasoning = message.optString("reasoning_content", "");
+            return reasoning.isBlank() ? null : reasoning;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 判断 400 响应是否在抱怨 temperature 参数。
+     */
+    static boolean mentionsTemperature(String body) {
+        return body != null && body.toLowerCase(Locale.ROOT).contains("temperature");
+    }
+
+    /**
+     * 记录本次调用的模型与 token 消耗，字段缺失时不影响主流程。
+     */
+    private void logUsage(String body) {
+        try {
+            JSONObject root = new JSONObject(body);
+            JSONObject usage = root.optJSONObject("usage");
+            long created = root.optLong("created", 0);
+            LocalDateTime createdTime = created > 0
+                    ? Instant.ofEpochSecond(created).atZone(ZoneId.systemDefault()).toLocalDateTime()
+                    : LocalDateTime.now();
+
+            log.info("AI响应: id={}, time={}, model={}, promptTokens={}, completionTokens={}, totalTokens={}",
+                    root.optString("id"),
+                    createdTime.format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")),
+                    root.optString("model"),
+                    usage != null ? usage.optInt("prompt_tokens", -1) : -1,
+                    usage != null ? usage.optInt("completion_tokens", -1) : -1,
+                    usage != null ? usage.optInt("total_tokens", -1) : -1);
+        } catch (Exception e) {
+            log.debug("解析 AI 响应用量信息失败: {}", e.getMessage());
         }
     }
 

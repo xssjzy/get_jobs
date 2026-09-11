@@ -76,28 +76,68 @@ cd get_jobs
 
 更多环境配置详情请点击：📚 [环境配置](https://github.com/loks666/get_jobs/wiki/环境配置)
 
+### 2️⃣.5 首次使用：初始化数据库（**必做，否则起不来**）
+
+本仓库**不提交** `db/getjobs.db`，因为程序登录后会把各平台的会话 cookie 写进这个文件，
+跟踪它等于把自己的登录态往仓库里推。仓库里只放一份清空了 cookie 的种子库。
+
+首次使用时复制一份：
+
+```bash
+cp db/getjobs.seed.db db/getjobs.db
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item db\getjobs.seed.db db\getjobs.db
+```
+
+> 这一步不能跳过。程序不会自动建表（`spring.sql.init.mode` 为 `never`，仓库里也没有 DDL 脚本），
+> 缺了这个文件 SQLite 会建一个空库，然后每次查询都因为表不存在而失败。
+> 种子库里已含城市、行业等 578 条选项数据，复制后直接可用。
+
 ### 3️⃣ 网页端修改配置，并保存(一般默认即可,需要修改自己的地区和岗位)
 
 - 🤖 AI配置
 
-    - `.env`配制如下：
-      ```
-      HOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=your_key_here
-      BASE_URL=https://api.openai.com
-      API_KEY=sk-xxx
-      MODEL=gpt-5-nano
-      ```
-    - `HOOK_URL`：企业微信机器人推送的链接
-    - `BASE_URL`：直连或中转链接地址
-    - `API_KEY`：调用的API KEY
-    - `MODEL`：需要使用的模型名称
+  在网页端「环境变量配置」页面填写，不再使用 `.env` 文件，配置存在 SQLite 里。
 
-  > 根据测试，boss直聘在每天所有的岗位投递结束后消耗的额度(gpt-5-nano)大约在0.06美元(6美分)  
-  > 左右，代理除了在本项目中可用，也可使用客户端(https://github.com/knowlimit/ChatGPT-NextWeb)进行使用  
-  > 在日常生活中使用，所以不会浪费，充值额度1刀起，随用随充  
-  > 💥注意！AI代理地址:如云API:https://api.ruyun.fun/
-  ，该网站可自主充值需要的金额，无任何捆绑消费，支持市面上全部大模型，2人民币=1美元，base_url默认使用"https://api.ruyun.fun/"
-  即可
+    - `AI 厂商`：下拉选择，选中后自动填好地址与模型名
+    - `BASE_URL`：API 服务器地址
+    - `API_KEY`：调用的 API KEY
+    - `MODEL`：需要使用的模型名称
+    - `HOOK_URL`：企业微信机器人推送的链接
+
+  本项目按 **OpenAI Chat Completions 协议** 调用，凡兼容该协议的厂商都能用，换厂商不需要改代码。
+  内置预设如下，要用别家接口就选「自定义」手填地址与模型名：
+
+  | 厂商 | BASE_URL | 常用模型 |
+  | --- | --- | --- |
+  | DeepSeek | `https://api.deepseek.com` | `deepseek-flash` |
+  | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+  | Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+  | 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+  | 火山方舟 | `https://ark.cn-beijing.volces.com/api/v3` | `doubao-pro-32k` |
+  | 硅基流动 | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3` |
+  | OpenAI | `https://api.openai.com` | `gpt-4o-mini` |
+
+  > 配好后可用 `http://localhost:8888/api/ai/chat?content=你好` 验证是否连通。  
+  > 国内厂商无须代理。本项目本来就要求关闭墙外代理，用国产模型在这点上更省事。
+
+  ⚠️ **上表的模型名会过期。** 各家换代时旧名字会被停用，调用直接报错。
+  例如 DeepSeek 的 `deepseek-chat` 和 `deepseek-reasoner` 已于 2026-07-24 停用。
+  上表最后一次核对：2026-09-11，其中只有 DeepSeek 经官方文档确认。
+
+  所以别只依赖上表。填好地址与密钥后，点「AI模型」右上角的 **拉取可用模型**，
+  程序会向厂商索取当前清单并填进输入框的候选里，点输入框即可选择，也仍可手填清单外的名字。
+  该按钮会先保存配置再拉取，因此拉的一定是你刚填的那家。
+
+  等价的命令行做法：
+
+  ```bash
+  curl -H "Authorization: Bearer $API_KEY" https://api.deepseek.com/v1/models
+  ```
 
     - AI生成的打招呼语示例  
       <img src="src/main/resources/images/AiSayHi.png" alt="AI生成的打招呼语示例">
