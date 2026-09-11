@@ -30,7 +30,7 @@ public class PlaywrightController {
     public ResponseEntity<Map<String, Object>> getStatus() {
         Map<String, Object> status = new HashMap<>();
         status.put("initialized", playwrightManager.isInitialized());
-        status.put("cdpPort", playwrightManager.getCdpPort());
+        // cdpPort 已移除：不再开启 CDP 调试端口，见 PlaywrightManager.init()
         status.put("hasBossPage", playwrightManager.getBossPage() != null);
         status.put("hasBrowser", playwrightManager.getBrowser() != null);
         status.put("bossLoggedIn", playwrightManager.isLoggedIn("boss"));
