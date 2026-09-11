@@ -127,13 +127,17 @@ Copy-Item db\getjobs.seed.db db\getjobs.db
 
   ⚠️ **上表的模型名会过期。** 各家换代时旧名字会被停用，调用直接报错。
   例如 DeepSeek 的 `deepseek-chat` 和 `deepseek-reasoner` 已于 2026-07-24 停用。
-  报「model not found」之类的错时，去厂商控制台查当前模型名，或直接列出可用型号：
+  上表最后一次核对：2026-09-11，其中只有 DeepSeek 经官方文档确认。
+
+  所以别只依赖上表。填好地址与密钥后，点「AI模型」右上角的 **拉取可用模型**，
+  程序会向厂商索取当前清单并填进输入框的候选里，点输入框即可选择，也仍可手填清单外的名字。
+  该按钮会先保存配置再拉取，因此拉的一定是你刚填的那家。
+
+  等价的命令行做法：
 
   ```bash
   curl -H "Authorization: Bearer $API_KEY" https://api.deepseek.com/v1/models
   ```
-
-  上表最后一次核对：2026-09-11，其中只有 DeepSeek 经官方文档确认。
 
     - AI生成的打招呼语示例  
       <img src="src/main/resources/images/AiSayHi.png" alt="AI生成的打招呼语示例">

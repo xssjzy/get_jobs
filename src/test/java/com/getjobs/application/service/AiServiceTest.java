@@ -7,6 +7,8 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.List;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -98,6 +100,98 @@ class AiServiceTest {
         void nullBaseUrlFailsLoudly() {
             assertThrows(IllegalStateException.class,
                     () -> AiService.buildChatCompletionsEndpoint(null));
+        }
+    }
+
+    @Nested
+    @DisplayName("模型列表端点")
+    class BuildModelsEndpoint {
+
+        @ParameterizedTest(name = "{0} -> {1}")
+        @DisplayName("与 chat 端点共用同一套拼接规则")
+        @CsvSource({
+                "https://api.deepseek.com,                          https://api.deepseek.com/v1/models",
+                "https://open.bigmodel.cn/api/paas/v4,              https://open.bigmodel.cn/api/paas/v4/models",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1, https://dashscope.aliyuncs.com/compatible-mode/v1/models",
+                "https://ark.cn-beijing.volces.com/api/v3,          https://ark.cn-beijing.volces.com/api/v3/models",
+                "api.deepseek.com,                                  https://api.deepseek.com/v1/models",
+        })
+        void followsSameRulesAsChatEndpoint(String input, String expected) {
+            assertEquals(expected, AiService.buildModelsEndpoint(input));
+        }
+
+        @Test
+        @DisplayName("填的是完整 chat 端点时退回父路径，而不是拼成 chat/completions/models")
+        void stripsChatCompletionsSuffix() {
+            assertEquals("https://api.deepseek.com/v1/models",
+                    AiService.buildModelsEndpoint("https://api.deepseek.com/v1/chat/completions"));
+        }
+
+        @Test
+        @DisplayName("带查询参数的完整 chat 端点也能退回父路径")
+        void stripsChatCompletionsWithQueryString() {
+            assertEquals("https://x.openai.azure.com/openai/deployments/gpt4/models",
+                    AiService.buildModelsEndpoint(
+                            "https://x.openai.azure.com/openai/deployments/gpt4/chat/completions?api-version=2024-02-01"));
+        }
+
+        @Test
+        @DisplayName("已经指向 /models 时原样使用")
+        void alreadyModelsEndpoint() {
+            String full = "https://api.deepseek.com/v1/models";
+            assertEquals(full, AiService.buildModelsEndpoint(full));
+        }
+
+        @Test
+        @DisplayName("地址为空时报出明确的配置缺失")
+        void blankBaseUrlFailsLoudly() {
+            assertThrows(IllegalStateException.class, () -> AiService.buildModelsEndpoint(""));
+        }
+    }
+
+    @Nested
+    @DisplayName("模型列表解析")
+    class ExtractModelIds {
+
+        @Test
+        @DisplayName("解析 OpenAI 协议的标准形状并去重排序")
+        void readsStandardShape() {
+            String body = """
+                    {"object":"list","data":[
+                      {"id":"deepseek-v4-pro","object":"model"},
+                      {"id":"deepseek-flash","object":"model"},
+                      {"id":"deepseek-flash","object":"model"}
+                    ]}
+                    """;
+            assertEquals(List.of("deepseek-flash", "deepseek-v4-pro"), AiService.extractModelIds(body));
+        }
+
+        @Test
+        @DisplayName("兼容直接返回数组的实现")
+        void readsBareArray() {
+            String body = "[{\"id\":\"glm-4-flash\"},{\"id\":\"glm-4-air\"}]";
+            assertEquals(List.of("glm-4-air", "glm-4-flash"), AiService.extractModelIds(body));
+        }
+
+        @ParameterizedTest
+        @DisplayName("结构不符合预期时返回空列表，由调用方提示手填")
+        @ValueSource(strings = {
+                "{}",
+                "{\"data\":[]}",
+                "{\"data\":[{}]}",
+                "{\"error\":{\"message\":\"invalid api key\"}}",
+                "not json at all",
+                "",
+                "   ",
+        })
+        void malformedBodyReturnsEmpty(String body) {
+            assertTrue(AiService.extractModelIds(body).isEmpty());
+        }
+
+        @Test
+        @DisplayName("body 为 null 时返回空列表")
+        void nullBodyReturnsEmpty() {
+            assertTrue(AiService.extractModelIds(null).isEmpty());
         }
     }
 

@@ -27,6 +27,11 @@ export default function EnvConfig() {
   // 当前选中的厂商。不入库，加载时由 BASE_URL 反查得出，详见 lib/ai-providers.ts
   const [providerId, setProviderId] = useState<string>(DEFAULT_PROVIDER_ID)
 
+  // 从厂商拉回来的可用模型清单，空表示还没拉过
+  const [models, setModels] = useState<string[]>([])
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState<string | null>(null)
+
   const [showApiKey, setShowApiKey] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -79,6 +84,9 @@ export default function EnvConfig() {
   // 切换厂商：填入该厂商的地址与模型名。两个输入框仍可手改，选「自定义」则保留现有值。
   const handleProviderChange = (id: string) => {
     setProviderId(id)
+    // 换了厂商，上一家的模型清单就不作数了
+    setModels([])
+    setModelsError(null)
     const provider = AI_PROVIDERS[id]
     if (id === CUSTOM_PROVIDER_ID || !provider) return
     setEnvConfig((prev) => ({ ...prev, baseUrl: provider.baseUrl, model: provider.model }))
@@ -88,6 +96,45 @@ export default function EnvConfig() {
   const handleBaseUrlChange = (baseUrl: string) => {
     setEnvConfig((prev) => ({ ...prev, baseUrl }))
     setProviderId(detectProviderId(baseUrl))
+    // 换了厂商，上一家的模型清单就不作数了
+    setModels([])
+    setModelsError(null)
+  }
+
+  /**
+   * 向厂商索取当前可用的模型清单。
+   *
+   * 预设里的模型名会随厂商换代停用（DeepSeek 的 deepseek-chat 就在 2026-07-24 停了），
+   * 所以这里直接问厂商要。由后端代为请求：厂商接口基本不发 CORS 头，浏览器直连会被拦。
+   *
+   * 注意：拉取用的是已保存到数据库的地址和密钥，不是输入框里的当前值。
+   * 所以要先保存再拉，下面的按钮就是这么做的。
+   */
+  const fetchModels = async () => {
+    try {
+      setModelsLoading(true)
+      setModelsError(null)
+
+      // 先静默保存，否则拉的是上一次保存的地址，刚换的厂商不生效
+      const saved = await handleSave(true)
+      if (!saved) {
+        throw new Error('保存配置失败，无法拉取模型。请检查后端服务是否正常运行')
+      }
+
+      const response = await fetch('http://localhost:8888/api/ai/models')
+      const result = await response.json()
+
+      if (!result.success) {
+        throw new Error(result.message || '拉取失败')
+      }
+      setModels(result.data || [])
+    } catch (error) {
+      console.error('拉取模型列表失败:', error)
+      setModels([])
+      setModelsError(error instanceof Error ? error.message : '拉取失败，请检查地址与密钥')
+    } finally {
+      setModelsLoading(false)
+    }
   }
 
   const handleSave = async (silent: boolean = false) => {
@@ -121,6 +168,7 @@ export default function EnvConfig() {
           setSaveResult({ success: true, message: '保存成功' })
           setShowSaveDialog(true)
         }
+        return true
       } else {
         throw new Error(result.message || '保存配置失败')
       }
@@ -130,6 +178,8 @@ export default function EnvConfig() {
         setSaveResult({ success: false, message: '保存配置失败：网络或服务异常。' })
         setShowSaveDialog(true)
       }
+      // 返回成败供静默保存的调用方判断，例如拉取模型前要确认地址已落库
+      return false
     } finally {
       setSaving(false)
     }
@@ -244,15 +294,42 @@ export default function EnvConfig() {
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="model">AI模型</Label>
+                  <div className="flex items-center justify-between gap-2">
+                    <Label htmlFor="model">AI模型</Label>
+                    <button
+                      type="button"
+                      onClick={fetchModels}
+                      disabled={modelsLoading || !envConfig.baseUrl || !envConfig.apiKey}
+                      className="text-xs text-primary underline underline-offset-2 hover:opacity-80 disabled:opacity-40 disabled:no-underline disabled:cursor-not-allowed"
+                    >
+                      {modelsLoading ? '拉取中...' : '拉取可用模型'}
+                    </button>
+                  </div>
                   <Input
                     id="model"
                     type="text"
+                    list="model-options"
                     value={envConfig.model}
                     onChange={(e) => setEnvConfig({ ...envConfig, model: e.target.value })}
                     placeholder="deepseek-flash"
                   />
-                  <p className="text-xs text-muted-foreground">使用的AI模型名称</p>
+                  {/* 用 datalist 而不是下拉：既能从清单里选，也能手填清单外的名字 */}
+                  <datalist id="model-options">
+                    {models.map((m) => (
+                      <option key={m} value={m} />
+                    ))}
+                  </datalist>
+                  {modelsError ? (
+                    <p className="text-xs text-red-400">{modelsError}</p>
+                  ) : models.length > 0 ? (
+                    <p className="text-xs text-emerald-400">
+                      已拉取 {models.length} 个模型，点输入框可从清单中选择
+                    </p>
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      使用的AI模型名称。模型名会随厂商换代停用，报错时点上方「拉取可用模型」看当前有哪些
+                    </p>
+                  )}
                 </div>
               </div>
             </div>

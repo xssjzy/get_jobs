@@ -39,6 +39,9 @@ public class AiService {
     /** chat/completions 在各厂商中的统一路径后缀 */
     private static final String CHAT_COMPLETIONS_SUFFIX = "/chat/completions";
 
+    /** 列出可用模型的路径后缀 */
+    private static final String MODELS_SUFFIX = "/models";
+
     /** 未带版本段的纯域名需要补上的默认版本段 */
     private static final String DEFAULT_VERSION_SEGMENT = "/v1";
 
@@ -84,6 +87,103 @@ public class AiService {
             throw new RuntimeException("AI响应无法解析，原始内容: " + response.body());
         }
         return replyContent;
+    }
+
+    /**
+     * 列出当前 BASE_URL 下可用的模型。
+     *
+     * <p>存在的意义：模型名会随厂商换代而停用（例如 deepseek-chat 在 2026-07-24 停用），
+     * 把名字硬编码在前端预设里迟早会腐烂。这里直接问厂商要一份当前清单。
+     *
+     * <p>由后端代为请求而不是前端直连，有两个原因：厂商接口基本都不发 CORS 头，
+     * 浏览器直连会被拦；而且密钥留在后端不必交给页面。
+     *
+     * @return 模型名列表，已去重排序
+     * @throws RuntimeException 配置缺失、请求失败或响应无法解析时抛出
+     */
+    public java.util.List<String> listAvailableModels() {
+        // 只需要地址与密钥，不要求 MODEL 已填，否则清空模型名后就拉不了清单了
+        String baseUrl = configService.requireConfigValue("BASE_URL");
+        String apiKey = configService.requireConfigValue("API_KEY");
+        String endpoint = buildModelsEndpoint(baseUrl);
+
+        HttpResponse<String> response = get(endpoint, apiKey);
+        if (response.statusCode() != 200) {
+            log.error("拉取模型列表失败: status={}, endpoint={}, body={}",
+                    response.statusCode(), endpoint, response.body());
+            throw new RuntimeException("拉取模型列表失败，状态码: " + response.statusCode()
+                    + ", 详情: " + response.body());
+        }
+
+        java.util.List<String> ids = extractModelIds(response.body());
+        if (ids.isEmpty()) {
+            log.warn("模型列表为空或无法解析: endpoint={}, body={}", endpoint, response.body());
+            throw new RuntimeException("该接口没有返回可识别的模型列表，请手动填写模型名。原始响应: "
+                    + response.body());
+        }
+        log.info("拉取到 {} 个模型: endpoint={}", ids.size(), endpoint);
+        return ids;
+    }
+
+    /**
+     * 从 OpenAI 协议的 /models 响应中取出模型名。
+     *
+     * <p>标准形状是 {@code {"object":"list","data":[{"id":"..."}]}}；
+     * 部分兼容层直接返回数组，也一并支持。取不到就返回空列表，由调用方报错。
+     */
+    static java.util.List<String> extractModelIds(String body) {
+        if (body == null || body.isBlank()) {
+            return java.util.List.of();
+        }
+        try {
+            JSONArray items;
+            String trimmed = body.trim();
+            if (trimmed.startsWith("[")) {
+                items = new JSONArray(trimmed);
+            } else {
+                items = new JSONObject(trimmed).optJSONArray("data");
+            }
+            if (items == null) {
+                return java.util.List.of();
+            }
+
+            var ids = new java.util.TreeSet<String>();
+            for (int i = 0; i < items.length(); i++) {
+                JSONObject item = items.optJSONObject(i);
+                String id = item == null ? items.optString(i, "") : item.optString("id", "");
+                if (!id.isBlank()) {
+                    ids.add(id);
+                }
+            }
+            return java.util.List.copyOf(ids);
+        } catch (Exception e) {
+            return java.util.List.of();
+        }
+    }
+
+    /**
+     * 发起一次 GET 请求，认证头与 POST 保持一致。
+     */
+    private HttpResponse<String> get(String endpoint, String apiKey) {
+        HttpClient client = HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .build();
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .timeout(Duration.ofSeconds(TIMEOUT_SECONDS))
+                .header("Accept", "application/json")
+                .header("Authorization", "Bearer " + apiKey)
+                .header("api-key", apiKey)
+                .GET()
+                .build();
+
+        try {
+            return client.send(request, HttpResponse.BodyHandlers.ofString());
+        } catch (Exception e) {
+            log.error("拉取模型列表异常: endpoint={}", endpoint, e);
+            throw e instanceof RuntimeException ? (RuntimeException) e : new RuntimeException(e);
+        }
     }
 
     /**
@@ -157,29 +257,54 @@ public class AiService {
 
     /**
      * 根据 BASE_URL 推导 chat/completions 端点。
+     */
+    static String buildChatCompletionsEndpoint(String baseUrl) {
+        return buildEndpoint(baseUrl, CHAT_COMPLETIONS_SUFFIX);
+    }
+
+    /**
+     * 根据 BASE_URL 推导「列出可用模型」的端点。
+     *
+     * <p>若 BASE_URL 填的是完整的 chat/completions 地址，先退回它的父路径再拼 /models，
+     * 否则会拼出 .../chat/completions/models 这种不存在的地址。
+     */
+    static String buildModelsEndpoint(String baseUrl) {
+        String normalized = normalizeBaseUrl(baseUrl);
+        int idx = normalized.indexOf(CHAT_COMPLETIONS_SUFFIX);
+        if (idx > 0) {
+            normalized = normalized.substring(0, idx);
+        }
+        return buildEndpoint(normalized, MODELS_SUFFIX);
+    }
+
+    /**
+     * 把 BASE_URL 与目标路径后缀拼成完整端点。
+     *
+     * <p>chat/completions 与 models 共用这套规则。单独抄一份的话，拼错了不会当场报错，
+     * 只会在真正请求时变成 404，所以放在一处。
      *
      * <p>三条规则自上而下匹配：
      * <ol>
-     *   <li>路径已以 /chat/completions 结尾，视为完整端点，原样使用（兼容带查询参数的 Azure 地址）</li>
+     *   <li>路径已以该后缀结尾，视为完整端点，原样使用（兼容带查询参数的 Azure 地址）</li>
      *   <li>带路径（如智谱的 /api/paas/v4、通义千问的 /compatible-mode/v1），
-     *       说明厂商自带版本段，直接追加 /chat/completions</li>
-     *   <li>纯域名（如 api.deepseek.com），补上 /v1 再追加 /chat/completions</li>
+     *       说明厂商自带版本段，直接追加后缀</li>
+     *   <li>纯域名（如 api.deepseek.com），补上 /v1 再追加后缀</li>
      * </ol>
      */
-    static String buildChatCompletionsEndpoint(String baseUrl) {
+    static String buildEndpoint(String baseUrl, String suffix) {
         String normalized = normalizeBaseUrl(baseUrl);
         if (normalized.isEmpty()) {
             throw new IllegalStateException("缺少必要配置: BASE_URL");
         }
 
         String path = pathOf(normalized);
-        if (path.endsWith(CHAT_COMPLETIONS_SUFFIX)) {
+        if (path.endsWith(suffix)) {
             return normalized;
         }
         if (path.isEmpty() || path.equals("/")) {
-            return normalized + DEFAULT_VERSION_SEGMENT + CHAT_COMPLETIONS_SUFFIX;
+            return normalized + DEFAULT_VERSION_SEGMENT + suffix;
         }
-        return normalized + CHAT_COMPLETIONS_SUFFIX;
+        return normalized + suffix;
     }
 
     /**

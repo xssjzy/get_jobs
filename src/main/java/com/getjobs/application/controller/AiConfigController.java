@@ -86,6 +86,29 @@ public class AiConfigController {
     }
 
     /**
+     * 列出当前配置的 BASE_URL 下可用的模型。
+     *
+     * <p>供前端「拉取可用模型」按钮调用。模型名会随厂商换代停用，
+     * 与其把名字写死在前端预设里，不如直接问厂商要当前清单。
+     */
+    @GetMapping("/models")
+    public ResponseEntity<Map<String, Object>> listModels() {
+        Map<String, Object> response = new HashMap<>();
+        try {
+            var models = aiService.listAvailableModels();
+            response.put("success", true);
+            response.put("data", models);
+            response.put("message", "拉取到 " + models.size() + " 个模型");
+            return ResponseEntity.ok(response);
+        } catch (Exception e) {
+            log.error("拉取模型列表失败", e);
+            response.put("success", false);
+            response.put("message", e.getMessage());
+            return ResponseEntity.internalServerError().body(response);
+        }
+    }
+
+    /**
      * 健康检查接口
      * @return 服务状态
      */
