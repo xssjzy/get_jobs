@@ -80,24 +80,29 @@ cd get_jobs
 
 - 🤖 AI配置
 
-    - `.env`配制如下：
-      ```
-      HOOK_URL=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=your_key_here
-      BASE_URL=https://api.openai.com
-      API_KEY=sk-xxx
-      MODEL=gpt-5-nano
-      ```
-    - `HOOK_URL`：企业微信机器人推送的链接
-    - `BASE_URL`：直连或中转链接地址
-    - `API_KEY`：调用的API KEY
-    - `MODEL`：需要使用的模型名称
+  在网页端「环境变量配置」页面填写，不再使用 `.env` 文件，配置存在 SQLite 里。
 
-  > 根据测试，boss直聘在每天所有的岗位投递结束后消耗的额度(gpt-5-nano)大约在0.06美元(6美分)  
-  > 左右，代理除了在本项目中可用，也可使用客户端(https://github.com/knowlimit/ChatGPT-NextWeb)进行使用  
-  > 在日常生活中使用，所以不会浪费，充值额度1刀起，随用随充  
-  > 💥注意！AI代理地址:如云API:https://api.ruyun.fun/
-  ，该网站可自主充值需要的金额，无任何捆绑消费，支持市面上全部大模型，2人民币=1美元，base_url默认使用"https://api.ruyun.fun/"
-  即可
+    - `AI 厂商`：下拉选择，选中后自动填好地址与模型名
+    - `BASE_URL`：API 服务器地址
+    - `API_KEY`：调用的 API KEY
+    - `MODEL`：需要使用的模型名称
+    - `HOOK_URL`：企业微信机器人推送的链接
+
+  本项目按 **OpenAI Chat Completions 协议** 调用，凡兼容该协议的厂商都能用，换厂商不需要改代码。
+  内置预设如下，要用别家接口就选「自定义」手填地址与模型名：
+
+  | 厂商 | BASE_URL | 常用模型 |
+  | --- | --- | --- |
+  | DeepSeek | `https://api.deepseek.com` | `deepseek-chat` |
+  | 通义千问 | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `qwen-plus` |
+  | Kimi | `https://api.moonshot.cn/v1` | `moonshot-v1-8k` |
+  | 智谱 GLM | `https://open.bigmodel.cn/api/paas/v4` | `glm-4-flash` |
+  | 火山方舟 | `https://ark.cn-beijing.volces.com/api/v3` | `doubao-pro-32k` |
+  | 硅基流动 | `https://api.siliconflow.cn/v1` | `deepseek-ai/DeepSeek-V3` |
+  | OpenAI | `https://api.openai.com` | `gpt-4o-mini` |
+
+  > 配好后可用 `http://localhost:8888/api/ai/chat?content=你好` 验证是否连通。  
+  > 国内厂商无须代理。本项目本来就要求关闭墙外代理，用国产模型在这点上更省事。
 
     - AI生成的打招呼语示例  
       <img src="src/main/resources/images/AiSayHi.png" alt="AI生成的打招呼语示例">

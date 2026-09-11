@@ -6,7 +6,14 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import PageHeader from '@/app/components/PageHeader'
+import {
+  AI_PROVIDERS,
+  CUSTOM_PROVIDER_ID,
+  DEFAULT_PROVIDER_ID,
+  detectProviderId,
+} from '@/lib/ai-providers'
 
 export default function EnvConfig() {
   const [envConfig, setEnvConfig] = useState({
@@ -16,6 +23,9 @@ export default function EnvConfig() {
     model: '',
     botIsSend: 0,
   })
+
+  // 当前选中的厂商。不入库，加载时由 BASE_URL 反查得出，详见 lib/ai-providers.ts
+  const [providerId, setProviderId] = useState<string>(DEFAULT_PROVIDER_ID)
 
   const [showApiKey, setShowApiKey] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -52,6 +62,7 @@ export default function EnvConfig() {
             return val === '1' || val === 'true' ? 1 : 0
           })(),
         })
+        setProviderId(detectProviderId(result.data.BASE_URL))
       }
     } catch (error) {
       console.error('获取配置失败:', error)
@@ -64,6 +75,20 @@ export default function EnvConfig() {
   useEffect(() => {
     fetchConfig()
   }, [])
+
+  // 切换厂商：填入该厂商的地址与模型名。两个输入框仍可手改，选「自定义」则保留现有值。
+  const handleProviderChange = (id: string) => {
+    setProviderId(id)
+    const provider = AI_PROVIDERS[id]
+    if (id === CUSTOM_PROVIDER_ID || !provider) return
+    setEnvConfig((prev) => ({ ...prev, baseUrl: provider.baseUrl, model: provider.model }))
+  }
+
+  // 手改地址后让下拉跟着走，改回某个预设的地址就会重新选中它
+  const handleBaseUrlChange = (baseUrl: string) => {
+    setEnvConfig((prev) => ({ ...prev, baseUrl }))
+    setProviderId(detectProviderId(baseUrl))
+  }
 
   const handleSave = async (silent: boolean = false) => {
     try {
@@ -183,32 +208,52 @@ export default function EnvConfig() {
               <BiCodeAlt className="text-primary" />
               API 配置
             </CardTitle>
-            <CardDescription>配置 API 服务器地址和使用的 AI 模型</CardDescription>
+            <CardDescription>选择厂商后自动填好地址与模型，也可手动修改</CardDescription>
           </CardHeader>
           <CardContent>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-6">
               <div className="space-y-2">
-                <Label htmlFor="baseUrl">API Base URL</Label>
-                <Input
-                  id="baseUrl"
-                  type="text"
-                  value={envConfig.baseUrl}
-                  onChange={(e) => setEnvConfig({ ...envConfig, baseUrl: e.target.value })}
-                  placeholder="https://api.ruyun.fun"
-                />
-                <p className="text-xs text-muted-foreground">API服务器地址</p>
+                <Label htmlFor="provider">AI 厂商</Label>
+                <Select
+                  id="provider"
+                  value={providerId}
+                  onChange={(e) => handleProviderChange(e.target.value)}
+                >
+                  {Object.entries(AI_PROVIDERS).map(([id, provider]) => (
+                    <option key={id} value={id}>
+                      {provider.label}
+                    </option>
+                  ))}
+                </Select>
+                <p className="text-xs text-muted-foreground">
+                  列表内均兼容 OpenAI 协议。用别家接口请选「自定义」，手填下方地址与模型名即可，无须改代码。
+                </p>
               </div>
 
-              <div className="space-y-2">
-                <Label htmlFor="model">AI模型</Label>
-                <Input
-                  id="model"
-                  type="text"
-                  value={envConfig.model}
-                  onChange={(e) => setEnvConfig({ ...envConfig, model: e.target.value })}
-                  placeholder="gpt-5-nano-2025-08-07"
-                />
-                <p className="text-xs text-muted-foreground">使用的AI模型名称</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div className="space-y-2">
+                  <Label htmlFor="baseUrl">API Base URL</Label>
+                  <Input
+                    id="baseUrl"
+                    type="text"
+                    value={envConfig.baseUrl}
+                    onChange={(e) => handleBaseUrlChange(e.target.value)}
+                    placeholder="https://api.deepseek.com"
+                  />
+                  <p className="text-xs text-muted-foreground">API服务器地址</p>
+                </div>
+
+                <div className="space-y-2">
+                  <Label htmlFor="model">AI模型</Label>
+                  <Input
+                    id="model"
+                    type="text"
+                    value={envConfig.model}
+                    onChange={(e) => setEnvConfig({ ...envConfig, model: e.target.value })}
+                    placeholder="deepseek-chat"
+                  />
+                  <p className="text-xs text-muted-foreground">使用的AI模型名称</p>
+                </div>
               </div>
             </div>
           </CardContent>
@@ -247,6 +292,20 @@ export default function EnvConfig() {
               <p className="text-xs text-muted-foreground">
                 🔐 API密钥将被安全存储，请妥善保管
               </p>
+              {AI_PROVIDERS[providerId]?.docUrl && (
+                <p className="text-xs text-muted-foreground">
+                  还没有密钥？到
+                  <a
+                    href={AI_PROVIDERS[providerId].docUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="mx-1 text-primary underline underline-offset-2 hover:opacity-80"
+                  >
+                    {AI_PROVIDERS[providerId].label}
+                  </a>
+                  控制台申请
+                </p>
+              )}
             </div>
           </CardContent>
         </Card>
