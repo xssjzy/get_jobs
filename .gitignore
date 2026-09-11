@@ -14,7 +14,7 @@ CLAUDE.md
 .claude
 nul
 dist.zip
-db/
+db/*
 # Playwright
 .playwright/
 ms-playwright/
@@ -50,7 +50,7 @@ chromedriver
 *.jpg
 
 # Database files
-db/
+db/*
 *.db
 
 # Frontend build output
@@ -58,3 +58,6 @@ dist/
 
 # Gradle cache
 .gradle/
+# 干净种子库需要入库：首次使用时复制成 db/getjobs.db
+# 用 db/* 而不是 db/ 才能让 git 进入目录，否则下面这条放行不生效
+!db/getjobs.seed.db

@@ -76,6 +76,27 @@ cd get_jobs
 
 更多环境配置详情请点击：📚 [环境配置](https://github.com/loks666/get_jobs/wiki/环境配置)
 
+### 2️⃣.5 首次使用：初始化数据库（**必做，否则起不来**）
+
+本仓库**不提交** `db/getjobs.db`，因为程序登录后会把各平台的会话 cookie 写进这个文件，
+跟踪它等于把自己的登录态往仓库里推。仓库里只放一份清空了 cookie 的种子库。
+
+首次使用时复制一份：
+
+```bash
+cp db/getjobs.seed.db db/getjobs.db
+```
+
+Windows PowerShell：
+
+```powershell
+Copy-Item db\getjobs.seed.db db\getjobs.db
+```
+
+> 这一步不能跳过。程序不会自动建表（`spring.sql.init.mode` 为 `never`，仓库里也没有 DDL 脚本），
+> 缺了这个文件 SQLite 会建一个空库，然后每次查询都因为表不存在而失败。
+> 种子库里已含城市、行业等 578 条选项数据，复制后直接可用。
+
 ### 3️⃣ 网页端修改配置，并保存(一般默认即可,需要修改自己的地区和岗位)
 
 - 🤖 AI配置
